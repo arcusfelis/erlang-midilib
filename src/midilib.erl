@@ -58,15 +58,6 @@ quantized_event(Event, BeatsFromStart, Boundary) ->
 		   end,
     {{Name, NewDeltaTime, Values}, BeatsFromStart + DeltaTime}.
 
-quantized_delta_time(BeatsFromStart, DeltaTime, Boundary) ->
-    Diff = (BeatsFromStart + DeltaTime) div Boundary,
-    NewDeltaTime = if
-		       Diff >= Boundary / 2 ->
-			   DeltaTime - Diff;
-		       true ->
-			   DeltaTime - Diff + Boundary
-		   end,
-
 %% Given a MIDI note number, return the name and octave as a string.
 note_to_string(Num) ->
     Note = Num rem 12,
