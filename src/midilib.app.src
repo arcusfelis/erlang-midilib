@@ -1,0 +1,8 @@
+%% -*- erlang -*-
+{application, midilib,
+ [{description, "Erlang MIDI file and event manipulation library"},
+  {vsn, "1.0"},
+  {modules, []},
+  {registered, []},
+  {env, []},
+  {applications, [kernel, stdlib]}]}.
