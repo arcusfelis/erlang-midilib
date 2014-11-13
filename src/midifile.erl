@@ -24,215 +24,164 @@
 %% where values after DeltaTime are specific to each event type. If the value
 %% is a string, then the string appears instead of [values...].
 read(Path) ->
-    case file:open(Path, [read, binary, raw]) of
-	{ok, F} ->
-	    FilePos = look_for_chunk(F, 0, <<$M, $T, $h, $d>>,
-				     file:pread(F, 0, 4)),
-	    [Header, NumTracks] = parse_header(file:pread(F, FilePos, 10)),
-	    Tracks = read_tracks(F, NumTracks, FilePos + 10, []),
-	    file:close(F),
-	    [ConductorTrack | RemainingTracks] = Tracks,
-	    {seq, Header, ConductorTrack, RemainingTracks};
-	Error ->
-	    {Path, Error}
+    case file:read_file(Path) of
+	{ok, Bin} ->
+        binary_to_seq(Bin);
+    {error, Reason} ->
+	    {error, Reason}
     end.
 
-% Look for Cookie in file and return file position after Cookie.
-look_for_chunk(_F, FilePos, Cookie, {ok, Cookie}) ->
-    FilePos + size(Cookie);
-look_for_chunk(F, FilePos, Cookie, {ok, _}) ->
-    % This isn't efficient, because we only advance one character at a time.
-    % We should really look for the first char in Cookie and, if found,
-    % advance that far.
-    look_for_chunk(F, FilePos + 1, Cookie, file:pread(F, FilePos + 1,
-						      size(Cookie))).
+binary_to_seq(Bin) ->
+    % Look for Cookie
+    % Bin2 is after Cookie
+    [_Skip, Bin2] = binary:split(Bin, <<"MThd">>),
+    {Header, NumTracks, Bin3} = parse_header(Bin2),
+    {Tracks, _Bin4} = read_tracks(NumTracks, [], Bin3),
+    [ConductorTrack | RemainingTracks] = Tracks,
+    {seq, Header, ConductorTrack, RemainingTracks}.
 
-parse_header({ok, <<_BytesToRead:32/integer, Format:16/integer,
-		   NumTracks:16/integer, Division:16/integer>>}) ->
-   [{header, Format, Division}, NumTracks].
+parse_header(<<_BytesToRead:32/integer, Format:16/integer,
+		   NumTracks:16/integer, Division:16/integer, Bin/binary>>) ->
+   {{header, Format, Division}, NumTracks, Bin}.
 
-read_tracks(_F, 0, _FilePos, Tracks) ->
-    lists:reverse(Tracks);
-% TODO: make this distributed. Would need to scan each track to get start
-% position of next track.
-read_tracks(F, NumTracks, FilePos, Tracks) ->
-    ?DPRINT("read_tracks, NumTracks = ~p, FilePos = ~p~n",
-	    [NumTracks, FilePos]),
-    [Track, NextTrackFilePos] = read_track(F, FilePos),
-    ?DPRINT("read_tracks, NextTrackFilePos = ~p~n", [NextTrackFilePos]),
-    read_tracks(F, NumTracks - 1, NextTrackFilePos, [Track|Tracks]).
+read_tracks(0, Tracks, Bin) ->
+    {lists:reverse(Tracks), Bin};
+read_tracks(NumTracks, Tracks, Bin) ->
+    {Track, Bin2} = read_track(Bin),
+    read_tracks(NumTracks - 1, [Track|Tracks], Bin2).
 
-read_track(F, FilePos) ->
-    TrackStart = look_for_chunk(F, FilePos, <<$M, $T, $r, $k>>,
-				file:pread(F, FilePos, 4)),
-    BytesToRead = parse_track_header(file:pread(F, TrackStart, 4)),
-    ?DPRINT("reading track, FilePos = ~p, BytesToRead = ~p~n",
-	    [TrackStart, BytesToRead]),
-    ?DPRINT("next track pos = ~p~n", [TrackStart + 4 + BytesToRead]),
-    put(status, 0),
-    put(chan, -1),
-    [{track, event_list(F, TrackStart + 4, BytesToRead, [])},
-     TrackStart + 4 + BytesToRead].
+read_track(Bin) ->
+    [_Skip, Bin2] = binary:split(Bin, <<"MTrk">>),
+    {BytesToRead, Bin3} = parse_track_header(Bin2),
+    {TrackBin, Bin4} = erlang:split_binary(Bin3, BytesToRead),
+    Track = {track, event_list(TrackBin)},
+    {Track, Bin4}.
 
-parse_track_header({ok, <<BytesToRead:32/integer>>}) ->
-    BytesToRead.
+parse_track_header(<<BytesToRead:32/integer, Bin/binary>>) ->
+    {BytesToRead, Bin}.
 
-event_list(_F, _FilePos, 0, Events) ->
+event_list(Bin) ->
+    event_list(0, 0, [], Bin).
+
+event_list(_Status, _Chan, Events, <<>>) ->
     lists:reverse(Events);
-event_list(F, FilePos, BytesToRead, Events) ->
-    [DeltaTime, VarLenBytesUsed] = read_var_len(file:pread(F, FilePos, 4)),
-    {ok, ThreeBytes} = file:pread(F, FilePos+VarLenBytesUsed, 3),
-    ?DPRINT("reading event, FilePos = ~p, BytesToRead = ~p, ThreeBytes = ~p~n",
-	    [FilePos, BytesToRead, ThreeBytes]),
-    [Event, EventBytesRead] =
-	read_event(F, FilePos+VarLenBytesUsed, DeltaTime, ThreeBytes),
-    BytesRead = VarLenBytesUsed + EventBytesRead,
-    event_list(F, FilePos + BytesRead, BytesToRead - BytesRead, [Event|Events]).
+event_list(Status, Chan, Events, Bin) ->
+    {_, DeltaTime, Bin2} = read_var_len(Bin),
+    {Event, Status2, Chan2, Bin3} = read_event(DeltaTime, Status, Chan, Bin2),
+    event_list(Status2, Chan2, [Event|Events], Bin3).
 
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_OFF:4, Chan:4, Note:8, Vel:8>>) ->
-    ?DPRINT("off~n", []),
-    put(status, ?STATUS_NIBBLE_OFF),
-    put(chan, Chan),
-    [{off, DeltaTime, [Chan, Note, Vel]}, 3];
+read_event(DeltaTime, _, _,
+           <<?STATUS_NIBBLE_OFF:4, Chan:4, Note:8, Vel:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_OFF,
+    Event = {off, DeltaTime, [Chan, Note, Vel]}, 
+    {Event, Status, Chan, Bin};
 % note on, velocity 0 is a note off
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_ON:4, Chan:4, Note:8, 0:8>>) ->
-    ?DPRINT("off (using on vel 0)~n", []),
-    put(status, ?STATUS_NIBBLE_ON),
-    put(chan, Chan),
-    [{off, DeltaTime, [Chan, Note, 64]}, 3];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_ON:4, Chan:4, Note:8, Vel:8>>) ->
-    ?DPRINT("on~n", []),
-    put(status, ?STATUS_NIBBLE_ON),
-    put(chan, Chan),
-    [{on, DeltaTime, [Chan, Note, Vel]}, 3];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_POLY_PRESS:4, Chan:4, Note:8, Amount:8>>) ->
-    ?DPRINT("poly press~n", []),
-    put(status, ?STATUS_NIBBLE_POLY_PRESS),
-    put(chan, Chan),
-    [{poly_press, DeltaTime, [Chan, Note, Amount]}, 3];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_CONTROLLER:4, Chan:4, Controller:8, Value:8>>) ->
-    ?DPRINT("controller ch ~p, ctrl ~p, val ~p~n", [Chan, Controller, Value]),
-    put(status, ?STATUS_NIBBLE_CONTROLLER),
-    put(chan, Chan),
-    [{controller, DeltaTime, [Chan, Controller, Value]}, 3];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_PROGRAM_CHANGE:4, Chan:4, Program:8, _:8>>) ->
-    ?DPRINT("prog change~n", []),
-    put(status, ?STATUS_NIBBLE_PROGRAM_CHANGE),
-    put(chan, Chan),
-    [{program, DeltaTime, [Chan, Program]}, 2];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_CHANNEL_PRESSURE:4, Chan:4, Amount:8, _:8>>) ->
-    ?DPRINT("chan pressure~n", []),
-    put(status, ?STATUS_NIBBLE_CHANNEL_PRESSURE),
-    put(chan, Chan),
-    [{chan_press, DeltaTime, [Chan, Amount]}, 2];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_NIBBLE_PITCH_BEND:4, Chan:4, 0:1, LSB:7, 0:1, MSB:7>>) ->
-    ?DPRINT("pitch bend~n", []),
-    put(status, ?STATUS_NIBBLE_PITCH_BEND),
-    put(chan, Chan),
-    [{pitch_bend, DeltaTime, [Chan, <<0:2, MSB:7, LSB:7>>]}, 3];
-read_event(_F, _FilePos, DeltaTime,
-	   <<?STATUS_META_EVENT:8, ?META_TRACK_END:8, 0:8>>) ->
-    ?DPRINT("end of track~n", []),
-    put(status, ?STATUS_META_EVENT),
-    put(chan, 0),
-    [{track_end, DeltaTime, []}, 3];
-read_event(F, FilePos, DeltaTime, <<?STATUS_META_EVENT:8, Type:8, _:8>>) ->
-    ?DPRINT("meta event~n", []),
-    put(status, ?STATUS_META_EVENT),
-    put(chan, 0),
-    [Length, LengthBytesUsed] = read_var_len(file:pread(F, FilePos + 2, 4)),
-    LengthBeforeData = LengthBytesUsed + 2,
-    {ok, Data} = file:pread(F, FilePos + LengthBeforeData, Length),
-    TotalLength = LengthBeforeData + Length,
-    ?DPRINT("  type = ~p, var len = ~p, len before data = ~p, total len = ~p,~n  data = ~p~n",
-	      [Type, Length, LengthBeforeData, TotalLength, Data]),
+read_event(DeltaTime, _, _,
+           <<?STATUS_NIBBLE_ON:4, Chan:4, Note:8, 0:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_ON,
+    Event = {off, DeltaTime, [Chan, Note, 64]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+           <<?STATUS_NIBBLE_ON:4, Chan:4, Note:8, Vel:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_ON,
+    Event = {on, DeltaTime, [Chan, Note, Vel]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+           <<?STATUS_NIBBLE_POLY_PRESS:4, Chan:4, Note:8, Amount:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_POLY_PRESS,
+    Event = {poly_press, DeltaTime, [Chan, Note, Amount]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+           <<?STATUS_NIBBLE_CONTROLLER:4, Chan:4, Controller:8, Value:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_CONTROLLER,
+    Event = {controller, DeltaTime, [Chan, Controller, Value]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+	       <<?STATUS_NIBBLE_PROGRAM_CHANGE:4, Chan:4, Program:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_PROGRAM_CHANGE,
+    Event = {program, DeltaTime, [Chan, Program]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+	       <<?STATUS_NIBBLE_CHANNEL_PRESSURE:4, Chan:4, Amount:8, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_CHANNEL_PRESSURE,
+    Event = {chan_press, DeltaTime, [Chan, Amount]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+	       <<?STATUS_NIBBLE_PITCH_BEND:4, Chan:4, 0:1, LSB:7, 0:1, MSB:7, Bin/binary>>) ->
+    Status = ?STATUS_NIBBLE_PITCH_BEND,
+    Event = {pitch_bend, DeltaTime, [Chan, <<0:2, MSB:7, LSB:7>>]},
+    {Event, Status, Chan, Bin};
+read_event(DeltaTime, _, _,
+	       <<?STATUS_META_EVENT:8, ?META_TRACK_END:8, 0:8, Bin/binary>>) ->
+    Status = ?STATUS_META_EVENT,
+    Event = {track_end, DeltaTime, []},
+    {Event, Status, 0, Bin};
+read_event(DeltaTime, _, _,
+           <<?STATUS_META_EVENT:8, Type:8, Bin/binary>>) ->
+    Status = ?STATUS_META_EVENT,
+    {_, Length, Bin2} = read_var_len(Bin),
+    {Data, Bin3} = erlang:split_binary(Bin2, Length),
+    Event = parse_meta_event(Type, DeltaTime, Data),
+    {Event, Status, 0, Bin3};
+read_event(DeltaTime, _, _,
+           <<?STATUS_SYSEX:8, Bin/binary>>) ->
+    Status = ?STATUS_SYSEX,
+    {_, Length, Bin2} = read_var_len(Bin),
+    {Data, Bin3} = erlang:split_binary(Bin2, Length),
+    Event = {sysex, DeltaTime, [Data]},
+    {Event, Status, 0, Bin3};
+% Handle running status bytes
+read_event(DeltaTime, Status, Chan,
+           <<B0:8, B1:8, Bin/binary>>) when B0 < 128 ->
+	read_event(DeltaTime, Status, Chan,
+               <<Status:4, Chan:4, B0:8, B1:8, Bin/binary>>).
+
+parse_meta_event(Type, DeltaTime, Data) ->
     case Type of
 	?META_SEQ_NUM ->
-	    [{seq_num, DeltaTime, [Data]}, TotalLength];
+	    {seq_num, DeltaTime, [Data]};
 	?META_TEXT ->
-	    [{text, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {text, DeltaTime, binary_to_list(Data)};
 	?META_COPYRIGHT ->
-	    [{copyright, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {copyright, DeltaTime, binary_to_list(Data)};
 	?META_SEQ_NAME ->
-	    [{seq_name, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {seq_name, DeltaTime, binary_to_list(Data)};
 	?META_INSTRUMENT ->
-	    [{instrument, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {instrument, DeltaTime, binary_to_list(Data)};
 	?META_LYRIC ->
-	    [{lyric, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {lyric, DeltaTime, binary_to_list(Data)};
 	?META_MARKER ->
-	    [{marker, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {marker, DeltaTime, binary_to_list(Data)};
 	?META_CUE ->
-	    [{cue, DeltaTime, binary_to_list(Data)}, TotalLength];
+	    {cue, DeltaTime, binary_to_list(Data)};
 	?META_MIDI_CHAN_PREFIX ->
-	    [{midi_chan_prefix, DeltaTime, [Data]}, TotalLength];
+	    {midi_chan_prefix, DeltaTime, [Data]};
 	?META_SET_TEMPO ->
 	    % Data is microseconds per quarter note, in three bytes
 	    <<B0:8, B1:8, B2:8>> = Data,
-	    [{tempo, DeltaTime, [(B0 bsl 16) + (B1 bsl 8) + B2]}, TotalLength];
+	    {tempo, DeltaTime, [(B0 bsl 16) + (B1 bsl 8) + B2]};
 	?META_SMPTE ->
-	    [{smpte, DeltaTime, [Data]}, TotalLength];
+	    {smpte, DeltaTime, [Data]};
 	?META_TIME_SIG ->
-	    [{time_signature, DeltaTime, [Data]}, TotalLength];
+	    {time_signature, DeltaTime, [Data]};
 	?META_KEY_SIG ->
-	    [{key_signature, DeltaTime, [Data]}, TotalLength];
+	    {key_signature, DeltaTime, [Data]};
 	?META_SEQUENCER_SPECIFIC ->
-	    [{seq_name, DeltaTime, [Data]}, TotalLength];
+	    {seq_name, DeltaTime, [Data]};
 	_ ->
-	    ?DPRINT("  unknown meta type ~p~n", [Type]),
-	    [{unknown_meta, DeltaTime, [Type, Data]}, TotalLength]
-    end;
-read_event(F, FilePos, DeltaTime, <<?STATUS_SYSEX:8, _:16>>) ->
-    ?DPRINT("sysex~n", []),
-    put(status, ?STATUS_SYSEX),
-    put(chan, 0),
-    [Length, LengthBytesUsed] = read_var_len(file:pread(F, FilePos + 1, 4)),
-    {ok, Data} = file:pread(F, FilePos + LengthBytesUsed, Length),
-    [{sysex, DeltaTime, [Data]}, LengthBytesUsed + Length];
-% Handle running status bytes
-read_event(F, FilePos, DeltaTime, <<B0:8, B1:8, _:8>>) when B0 < 128 ->
-    Status = get(status),
-    Chan = get(chan),
-    ?DPRINT("running status byte, status = ~p, chan = ~p~n", [Status, Chan]),
-    [Event, NumBytes] =
-	read_event(F, FilePos, DeltaTime, <<Status:4, Chan:4, B0:8, B1:8>>),
-    [Event, NumBytes - 1];
-read_event(_F, _FilePos, DeltaTime, <<Unknown:8, _:16>>) ->
-    ?DPRINT("unknown byte ~p~n", [Unknown]),
-    put(status, 0),
-    put(chan, 0),
-%    exit("Unknown status byte " ++ Unknown).
-    [{unknown_status, DeltaTime, [Unknown]}, 3].
+	    {unknown_meta, DeltaTime, [Type, Data]}
+    end.
 
-read_var_len({ok, <<0:1, B0:7, _:24>>}) ->
-    [B0, 1];
-read_var_len({ok, <<1:1, B0:7, 0:1, B1:7, _:16>>}) ->
-    [(B0 bsl 7) + B1, 2];
-read_var_len({ok, <<1:1, B0:7, 1:1, B1:7, 0:1, B2:7, _:8>>}) ->
-    [(B0 bsl 14) + (B1 bsl 7) + B2, 3];
-read_var_len({ok, <<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 0:1, B3:7>>}) ->
-    [(B0 bsl 21) + (B1 bsl 14) + (B2 bsl 7) + B3, 4];
-read_var_len({ok, <<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 1:1, B3:7>>}) ->
-    ?DPRINT("WARNING: bad var len format; all 4 bytes have high bit set~n", []),
-    [(B0 bsl 21) + (B1 bsl 14) + (B2 bsl 7) + B3, 4].
-
--ifdef(DEBUG).
-rvl(<<0:1, B0:7>>) ->
-    read_var_len({ok, <<0:1, B0:7, 0:8, 0:8, 0:8>>});
-rvl(<<1:1, B0:7, 0:1, B1:7>>) ->
-    read_var_len({ok, <<1:1, B0:7, 0:1, B1:7, 0:8, 0:8>>});
-rvl(<<1:1, B0:7, 1:1, B1:7, 0:1, B2:7>>) ->
-    read_var_len({ok, <<1:1, B0:7, 1:1, B1:7, 0:1, B2:7, 0:8>>});
-rvl(<<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 0:1, B3:7>>) ->
-    read_var_len({ok, <<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 0:1, B3:7>>}).
--endif.
+read_var_len(<<0:1, B0:7, Bin/binary>>) ->
+    {1, B0, Bin};
+read_var_len(<<1:1, B0:7, 0:1, B1:7, Bin/binary>>) ->
+    {2, (B0 bsl 7) + B1, Bin};
+read_var_len(<<1:1, B0:7, 1:1, B1:7, 0:1, B2:7, Bin/binary>>) ->
+    {3, (B0 bsl 14) + (B1 bsl 7) + B2, Bin};
+read_var_len(<<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 0:1, B3:7, Bin/binary>>) ->
+    {4, (B0 bsl 21) + (B1 bsl 14) + (B2 bsl 7) + B3, Bin};
+read_var_len(<<1:1, B0:7, 1:1, B1:7, 1:1, B2:7, 1:1, B3:7, Bin/binary>>) ->
+    {4, (B0 bsl 21) + (B1 bsl 14) + (B2 bsl 7) + B3, Bin}.
 
 write({seq, Header, ConductorTrack, Tracks}, Path) ->
     L = [header_io_list(Header, length(Tracks) + 1) |
@@ -305,7 +254,7 @@ event_io_list({chan_press, DeltaTime, [Chan, Amount]}) ->
 event_io_list({pitch_bend, DeltaTime, [Chan, <<0:2, MSB:7, LSB:7>>]}) ->
     [var_len(DeltaTime), running_status(?STATUS_NIBBLE_PITCH_BEND, Chan),
      <<0:1, LSB:7, 0:1, MSB:7>>];
-event_io_list({track_end, DeltaTime}) ->
+event_io_list({track_end, DeltaTime, []}) ->
     ?DPRINT("track_end~n", []),
     put(status, ?STATUS_META_EVENT),
     [var_len(DeltaTime), ?STATUS_META_EVENT, ?META_TRACK_END, 0];
