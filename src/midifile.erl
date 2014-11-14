@@ -351,7 +351,14 @@ encode_event(RunningChan, RunningStatus,
     encode_meta_event(RunningStatus, RunningChan, DeltaTime, Type, Data);
 encode_event(RunningChan, RunningStatus,
              {unknown_meta, DeltaTime, [Type, Data]}) ->
-    encode_meta_event(RunningStatus, RunningChan, DeltaTime, Type, Data).
+    encode_meta_event(RunningStatus, RunningChan, DeltaTime, Type, Data);
+encode_event(_RunningChan, _RunningStatus,
+             {sysex, DeltaTime, [Data]}) ->
+    Status = ?STATUS_SYSEX,
+    D = encode_delta(DeltaTime),
+    L = var_len(iolist_size(Data)),
+    Encoded = [D, Status, L, Data],
+    {Encoded, 0, Status}.
 
 encode_meta_event(_RunningStatus, _RunningChan, DeltaTime, Type, Data) ->
     Status = ?STATUS_META_EVENT,
