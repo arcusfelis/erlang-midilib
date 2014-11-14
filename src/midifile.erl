@@ -40,8 +40,8 @@ binary_to_seq(Bin) ->
     [ConductorTrack | RemainingTracks] = Tracks,
     {seq, Header, ConductorTrack, RemainingTracks}.
 
-parse_header(<<_BytesToRead:32/integer, Format:16/integer,
-		   NumTracks:16/integer, Division:16/integer, Bin/binary>>) ->
+parse_header(<<_BytesToRead:32, Format:16,
+		   NumTracks:16, Division:16, Bin/binary>>) ->
    {{header, Format, Division}, NumTracks, Bin}.
 
 read_tracks(0, Tracks, Bin) ->
@@ -57,7 +57,7 @@ read_track(Bin) ->
     Track = {track, event_list(TrackBin)},
     {Track, Bin4}.
 
-parse_track_header(<<BytesToRead:32/integer, Bin/binary>>) ->
+parse_track_header(<<BytesToRead:32, Bin/binary>>) ->
     {BytesToRead, Bin}.
 
 event_list(Bin) ->
