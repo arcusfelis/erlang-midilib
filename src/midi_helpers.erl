@@ -5,8 +5,11 @@
 -export([seq_to_tracks/1,
          track_to_events/1]).
 
+-export([fix_seq/1]).
+
 -export([split_first_track_into_channel_tracks/1,
-         split_first_track_into_tracks/1]).
+         split_first_track_into_tracks/1,
+         split_first_track_into_tracks_greedy/1]).
 
 
 -type midi_time() :: non_neg_integer().
@@ -34,6 +37,22 @@ absolute_to_relative_time([{Name, Time1, Args}|Events], Time) ->
     [{Name, Delta, Args}|Events1];
 absolute_to_relative_time([], _Time) ->
     [].
+
+
+%% Fix generac problems with tracks
+fix_seq({seq,Header,ConductorTrack,[]}) ->
+    %% Only one track
+    {seq,Header,{track,[]},[ConductorTrack]};
+fix_seq({seq,Header,ConductorTrack,Tracks}) ->
+    {seq,Header,ConductorTrack,remove_empty_tracks(Tracks)}.
+
+remove_empty_tracks(Tracks) ->
+    [Track || Track <- Tracks, not is_empty_track(Track)].
+
+%% Track is empty, if it does not contain at least one ON event
+is_empty_track(Track) ->
+    not lists:keymember(on, 1, track_to_events(Track)).
+
 
 seq_to_tracks({seq,_Header,_ConductorTrack,Tracks}) ->
     Tracks.
@@ -95,11 +114,7 @@ event_to_channel(_) ->
 
 
 
-split_first_track_into_tracks({seq,Header,ConductorTrack,Tracks}) ->
-    Seq = {seq,Header,{track,[]},[ConductorTrack|Tracks]},
-    split_first_track_into_tracks_1(Seq).
-
-split_first_track_into_tracks_1(Seq) ->
+split_first_track_into_tracks(Seq) ->
     Track1 = seq_to_first_tracks(Seq),
     SubTracks = split_track_into_tracks(Track1),
     replace_seq_tracks(SubTracks, Seq).
@@ -118,9 +133,11 @@ split_track_into_tracks(Track) ->
     SplitedGroupsList = [split_groups_by_hands(MatchedGroups) || MatchedGroups <- MatchedGroupsList],
     %% Put all notes together for each hand
     {LeftGroupsList, RightGroupsList} = lists:unzip(SplitedGroupsList),
+    {LeftGroupsList1, RightGroupsList1} =
+        minimize_difficulty_moving_groups(LeftGroupsList, RightGroupsList),
     %% Flatten, sort by time, remove duplicates
-    LeftGroups = lists:usort(lists:merge(LeftGroupsList)),
-    RightGroups = lists:usort(lists:merge(RightGroupsList)),
+    LeftGroups = lists:usort(lists:merge(LeftGroupsList1)),
+    RightGroups = lists:usort(lists:merge(RightGroupsList1)),
     %% Right hand plays more keys in case of collisions
     %% Remove all collisions from the left hand
     LeftGroups1 = ordsets:subtract(LeftGroups, RightGroups),
@@ -133,6 +150,117 @@ split_track_into_tracks(Track) ->
     LeftEvents2 = absolute_to_relative_time(LeftEvents1),
     RightEvents2 = absolute_to_relative_time(RightEvents1),
     [events_to_track(RightEvents2), events_to_track(LeftEvents2)].
+
+%% Returns modified groups for both left and right hands
+minimize_difficulty_moving_groups(LeftGroupsList, RightGroupsList) ->
+    LeftGroups = lists:usort(lists:merge(LeftGroupsList)),
+    RightGroups = lists:usort(lists:merge(RightGroupsList)),
+    InitDifficulty = calc_difficulty(LeftGroupsList, RightGroupsList),
+    %% Move groups from left to right
+    {Difficulty1, LeftGroupsList1, RightGroupsList1} =
+        minimize_difficulty_moving_groups_1(LeftGroups, InitDifficulty, LeftGroupsList, RightGroupsList),
+    %% Move groups from right to left
+    {_Difficulty2, RightGroupsList2, LeftGroupsList2} =
+        minimize_difficulty_moving_groups_1(RightGroups, Difficulty1, RightGroupsList1, LeftGroupsList1),
+    {LeftGroupsList2, RightGroupsList2}.
+
+minimize_difficulty_moving_groups_1([Group|Groups], OldDifficulty, OldFromGroupList, OldToGroupList) ->
+    {NewDifficulty, NewFromGroupList, NewToGroupList} =
+        minimize_difficulty_moving_groups_2(Group, OldDifficulty, OldFromGroupList, OldToGroupList),
+    minimize_difficulty_moving_groups_1(Groups, NewDifficulty, NewFromGroupList, NewToGroupList);
+minimize_difficulty_moving_groups_1([], Difficulty, FromGroupList, RightGroupsList) ->
+    {Difficulty, FromGroupList, RightGroupsList}.
+
+minimize_difficulty_moving_groups_2(Group, OldDifficulty, OldFromGroupList, OldToGroupList) ->
+    {NewFromGroupList, NewToGroupList} = move_group(Group, OldFromGroupList, OldToGroupList),
+    NewDifficulty = calc_difficulty(NewFromGroupList, NewToGroupList),
+    case NewDifficulty < OldDifficulty of
+        true -> % better choice
+            {NewDifficulty, NewFromGroupList, NewToGroupList};
+        false ->
+            {OldDifficulty, OldFromGroupList, OldToGroupList}
+    end.
+
+calc_difficulty(GroupsList1, GroupsList2) ->
+    D1 = calc_difficulty(GroupsList1),
+    D2 = calc_difficulty(GroupsList2),
+    D3 = calc_overlay_difficulty(GroupsList1, GroupsList2),
+    io:format("D1 ~p~nD2 ~p~nD3 ~p~n", [D1, D2, D3]),
+    D1 + D2 + D3.
+
+calc_overlay_difficulty(GroupsList1, GroupsList2) ->
+    CenterNotes1 = fix_undefined_centers(maybe_calc_centers(GroupsList1)),
+    CenterNotes2 = fix_undefined_centers(maybe_calc_centers(GroupsList2)),
+    Neighbors1 = zip_with_next(CenterNotes1),
+    Neighbors2 = zip_with_next(CenterNotes2),
+    Zipped1 = lists:zip(Neighbors1, Neighbors2),
+    Zipped2 = lists:zip(Neighbors2, Neighbors1),
+    lists:sum([calc_overlay_difficulty_1(X) || X <- Zipped1 ++ Zipped2]).
+
+%% Replace undefined notes with near onces
+fix_undefined_centers(CenterNotes) ->
+    fix_undefined_centers_1(first_defined(CenterNotes), CenterNotes).
+
+fix_undefined_centers_1(NearNote, [CenterNote|CenterNotes]) ->
+    CenterNote2 = select_center_note(NearNote, CenterNote),
+    NearNote2 = select_near_note(NearNote, CenterNote),
+    [CenterNote2|fix_undefined_centers_1(NearNote2, CenterNotes)];
+fix_undefined_centers_1(_NearNote, []) ->
+    [].
+
+select_center_note(NearNote, undefined) ->
+    NearNote; % fix CenterNote
+select_center_note(_NearNote, CenterNote) ->
+    CenterNote.
+
+select_near_note(NearNote, undefined) ->
+    NearNote; % keep old NearNote
+select_near_note(_NearNote, CenterNote) ->
+    CenterNote. % replace NearNote with CenterNote
+
+first_defined([undefined|T]) ->
+    first_defined(T);
+first_defined([H|_]) ->
+    H.
+
+calc_overlay_difficulty_1({{MyPrevCenver, MyNextCenter},
+                           {OtherPrevCenver, _OtherNextCenter}})
+    when is_integer(MyPrevCenver), is_integer(MyNextCenter), is_integer(OtherPrevCenver) ->
+    DiffFromMyCenter = abs(MyNextCenter - MyPrevCenver),
+    DiffFromOtherCenter = abs(MyNextCenter - OtherPrevCenver),
+    calc_overlay_difficulty_2(DiffFromMyCenter, DiffFromOtherCenter).
+
+calc_overlay_difficulty_2(DiffFromMyCenter, DiffFromOtherCenter)
+    when DiffFromOtherCenter < DiffFromMyCenter ->
+    Diff = DiffFromMyCenter - DiffFromOtherCenter,
+    calc_overlay_difficulty_3(Diff); % bad, probably a wrong hand
+calc_overlay_difficulty_2(_, _) ->
+    0.  % ok
+
+calc_overlay_difficulty_3(X) when X < 5 ->
+    5;
+calc_overlay_difficulty_3(X) when X < 10 ->
+    10;
+calc_overlay_difficulty_3(X) when X < 15 ->
+    25;
+calc_overlay_difficulty_3(_) ->
+    50.
+
+
+%% Move Group for each group of FromGroupList and ToGroupList
+move_group(Group, FromGroupList, ToGroupList) ->
+    Zipped = lists:zip(FromGroupList, ToGroupList),
+    Zipped1 = [move_group_1(Group, FromGroups, ToGroups) || {FromGroups, ToGroups} <- Zipped],
+    lists:unzip(Zipped1).
+
+move_group_1(Group, FromGroups, ToGroups) ->
+    case lists:member(Group, FromGroups) of
+        true ->
+            {lists:delete(Group, FromGroups),
+             [Group|lists:delete(Group, ToGroups)]}; % add, but not duplicate
+        false ->
+            {FromGroups, ToGroups}
+    end.
 
 times(Events) ->
     [Time || {_, Time, _} <- Events]. 
@@ -158,6 +286,7 @@ split_into_before_and_after_note(SortedGroups, Note) ->
     lists:splitwith(fun(Group) -> group_to_note(Group) < Note end, SortedGroups).
 
 
+%% See calc_center/1
 find_center([_|_]=SortedGroups) ->
     MinNote = group_to_note(hd(SortedGroups)),
     MaxNote = group_to_note(lists:last(SortedGroups)),
@@ -188,8 +317,14 @@ unlift_note_from_group({_Note, Group}) ->
 group_to_note({OnEvent, _OffEvent}) ->
     event_to_note(OnEvent).
 
+group_to_time({OnEvent, _OffEvent}) ->
+    event_to_time(OnEvent).
+
 event_to_note({_Event,_Time,[_Chan,Note,_Vel]}) ->
     Note.
+
+event_to_time({_Event,Time,[_Chan,_Note,_Vel]}) ->
+    Time.
 
 %% Select notes, that are on at time Time
 match_groups_by_time(Groups, Time) ->
@@ -254,3 +389,783 @@ find_pair(DeltaOn, Chan, Note, [_|Events]) ->
 find_pair(_DeltaOn, _Chan, _Note, []) ->
     undefined.
 
+
+
+
+%% Gets a list of pressed keys at each point of time for one hand
+calc_difficulty(ListOfGroups) ->
+    calc_difficulty_1(skip_empty_groups(ListOfGroups)).
+
+skip_empty_groups(ListOfGroups) ->
+    [Groups || [_|_]=Groups <- ListOfGroups].
+
+calc_difficulty_1(ListOfGroups) ->
+    RangeDiff = calc_range_difficulty(ListOfGroups),
+    MoveDiff = calc_movement_difficulty(ListOfGroups),
+    IntencityDiff = calc_intencity_difficulty(ListOfGroups),
+    io:format("RD ~p~nMD ~p~nID ~p~n", [ RangeDiff, MoveDiff, IntencityDiff]),
+    RangeDiff + MoveDiff + IntencityDiff.
+
+%% Calc, how hard to spread fingers
+calc_range_difficulty(ListOfGroups) ->
+    lists:sum([calc_range_difficulty_1(Groups) || Groups <- ListOfGroups]).
+
+calc_range_difficulty_1([_|_]=Groups) ->
+    range_to_difficulty(calc_range(Groups)).
+
+%% Magic numbers
+range_to_difficulty(X) when X < 7 ->
+    0; % trivial to play
+range_to_difficulty(X) when X < 11 ->
+    1; % simple to play
+range_to_difficulty(X) when X < 14 ->
+    5; % ok to play
+range_to_difficulty(X) when X < 16 ->
+    10; % playable
+range_to_difficulty(X) when X < 18 ->
+    20; % hard
+range_to_difficulty(X) when X < 20 ->
+    30; % impossible
+range_to_difficulty(_) ->
+    50. % wtf?
+
+%% Calc, how many hand movements
+calc_movement_difficulty(ListOfGroups) ->
+    CenterNotes = calc_centers(ListOfGroups),
+    Neighbors = zip_with_next(CenterNotes),
+    lists:sum([centers_to_difficulty(Center1, Center2) || {Center1, Center2} <- Neighbors]).
+
+%% Calc, how many keys to press at the same time
+calc_intencity_difficulty(ListOfGroups) ->
+    lists:sum([calc_intencity_difficulty_1(Groups) || Groups <- ListOfGroups]).
+
+calc_intencity_difficulty_1(Groups) ->
+    NumberOfKeys = length(Groups),
+    count_to_difficulty(NumberOfKeys).
+
+%% Magic numbers
+count_to_difficulty(X) when X < 4 ->
+    0; % trivial to play
+count_to_difficulty(X) when X < 5 ->
+    1; % ok to play
+count_to_difficulty(X) when X < 6 ->
+    5; % harder - all five fingers
+count_to_difficulty(_) ->
+    10. % One finger presses more than one key (difficult)
+
+centers_to_difficulty(Center1, Center2) ->
+    center_diff_to_difficulty(abs(Center1 - Center2)).
+
+%% Distance between notes to move to difficulty
+%% Magic numbers
+center_diff_to_difficulty(X) when X < 5 ->
+    0; % trivial to play
+center_diff_to_difficulty(X) when X < 10 ->
+    1; % ok to play
+center_diff_to_difficulty(X) when X < 15 ->
+    5; % less comfortable
+center_diff_to_difficulty(X) when X < 20 ->
+    10; % not comfortable
+center_diff_to_difficulty(X) when X < 30 ->
+    20; % hard
+center_diff_to_difficulty(_) ->
+    30.
+
+
+%% How much should we spead the hand?
+calc_range([_|_]=Groups) ->
+    Notes = groups_to_notes(Groups),
+    MinNote = lists:min(Notes),
+    MaxNote = lists:max(Notes),
+    MaxNote - MinNote.
+
+%% Same as find_center/1, but unsorted groups
+calc_center([_|_]=Groups) ->
+    Notes = groups_to_notes(Groups),
+    MinNote = lists:min(Notes),
+    MaxNote = lists:max(Notes),
+    find_center_1(MinNote, MaxNote).
+
+maybe_calc_center([]) ->
+    undefined;
+maybe_calc_center([_|_]=Groups) ->
+    Notes = groups_to_notes(Groups),
+    MinNote = lists:min(Notes),
+    MaxNote = lists:max(Notes),
+    find_center_1(MinNote, MaxNote).
+
+calc_centers(ListOfGroups) ->
+    [calc_center(Groups) || Groups <- ListOfGroups].
+
+maybe_calc_centers(ListOfGroups) ->
+    [maybe_calc_center(Groups) || Groups <- ListOfGroups].
+
+groups_to_notes(Groups) ->
+    [group_to_note(Group) || Group <- Groups].
+
+
+%% zip_with_next([1,2,3]) -> [{1,2},{2,3}].
+zip_with_next([H|[Next|_]=T]) ->
+    [{H,Next}|zip_with_next(T)];
+zip_with_next([_]) ->
+    [].
+
+
+
+split_first_track_into_tracks_greedy(Seq) ->
+    Track1 = seq_to_first_tracks(Seq),
+    SubTracks = split_track_into_tracks_greedy(Track1),
+    replace_seq_tracks(SubTracks, Seq).
+
+split_track_into_tracks_greedy(Track) ->
+    Events = track_to_events(Track),
+    Events1 = relative_to_absolute_time(Events),
+    %% Put corresponding ON and OFF events together into pairs
+    Groups = group_notes(Events1),
+    OtherEvents = filter_other_events(Events1),
+
+    GroupsTuple = groups_to_tuple(Groups),
+    Group2NoteIdDict = tuple_to_dict(GroupsTuple),
+    %% All ON absolute times
+    Times = groups_to_all_times(Groups),
+    %% All keys on keyboard
+    Notes = groups_to_all_notes(Groups),
+    %% {Time,Note} to pressed NoteId
+    TimeNote2NoteIdDict = build_time_note_to_note_id_dict(Times, Groups, Group2NoteIdDict),
+    %% Matrix (Time,Note) to pressed NoteId or 0
+    TimeNote2NoteIdMatrix = build_time_note_to_note_id_matrix(Times, Notes, TimeNote2NoteIdDict),
+    io:format("Before:~n~160p~n", [TimeNote2NoteIdMatrix]),
+    {LeftMatrix, RightMatrix} = rewrite_matrix(TimeNote2NoteIdMatrix),
+    LeftGroups = matrix_to_groups(LeftMatrix, GroupsTuple),
+    RightGroups = matrix_to_groups(RightMatrix, GroupsTuple),
+    [groups_to_track(RightGroups, OtherEvents),
+     groups_to_track(LeftGroups, OtherEvents)].
+
+matrix_to_groups(M, GroupsTuple) ->
+    NoteIds = unique_matrix_notes(M),
+    [notes_id_to_group(NoteId, GroupsTuple) || NoteId <- NoteIds].
+
+notes_id_to_group(NoteId, GroupsTuple) ->
+    element(NoteId, GroupsTuple).
+
+groups_to_track(Groups, OtherEvents) ->
+    Events = groups_to_events(Groups),
+    %% Add other events into both hands
+    Events1 = keymerge(2, Events, OtherEvents),
+    %% Use standard deltas
+    Events2 = absolute_to_relative_time(Events1),
+    events_to_track(Events2).
+
+groups_to_tuple(Groups) ->
+    list_to_tuple(Groups).
+
+tuple_to_dict(Tuple) ->
+    Size = tuple_size(Tuple),
+    NoteIds = lists:seq(1, Size),
+    Groups = tuple_to_list(Tuple),
+    Pairs = lists:zip(Groups, NoteIds),
+    dict:from_list(Pairs).
+
+pairs_to_dict(Pairs) ->
+    dict:from_list(Pairs).
+
+group_to_note_id(Group, Group2NoteIdDict) ->
+    dict:fetch(Group, Group2NoteIdDict).
+
+build_time_note_to_note_id_dict(Times, Groups, Group2NoteIdDict) ->
+    Pairs = build_time_note_to_note_id_pairs(Times, Groups, Group2NoteIdDict),
+    pairs_to_dict(Pairs).
+
+build_time_note_to_note_id_pairs(Times, Groups, Group2NoteIdDict) ->
+    [{{Time, group_to_note(Group)},
+      group_to_note_id(Group, Group2NoteIdDict)}
+     || Time <- Times,
+        Group <- Groups,
+        is_time_between(Group, Time)].
+
+
+build_time_note_to_note_id_matrix(Times, Notes, TimeNote2NoteIdDict) ->
+    [[time_and_note_to_note_id(Time, Note, TimeNote2NoteIdDict) || Note <- Notes] || Time <- Times].
+
+rewrite_matrix(M1) ->
+    %% Linking is much more safe operation
+    M2 = link_matrix(M1, 4),
+    M3 = rewrite_matrix(M2, 10, 1, 4),
+    io:format("Rewritten:~n~160p~n", [M3]),
+    io:format("C:~n~160p~n", [M3]),
+    %% Link again
+    M4 = link_matrix(M3, 4),
+    M5 = rewrite_matrix(M4, 10, 4, 12),
+    io:format("Rewritten again:~n~160p~n", [M5]),
+    M6 = connect_matrix(M5),
+    %% With bigger rewrite range
+    M7 = rewrite_matrix(M6, 16, 1, 30),
+    io:format("Rewritten hardcore:~n~160p~n", [M7]),
+    %% Unsplited parts in the middle left
+    %% i.e.:    LL          CC             RR
+    %% We should split them into:
+    %%          LL          LR             RR
+    M8 = split_middle_matrix(M7),
+    %% Use merged matrix for splits
+    AllSplits = matrix_to_splits(M8),
+    %% Split rewritten matrix for debugging
+    split_matrix_by_splits(AllSplits, M8),
+    %% Split original matrix
+    split_matrix_by_splits(AllSplits, M1).
+
+split_middle_matrix(Rows) ->
+    [split_middle_row(Row) || Row <- Rows].
+
+split_middle_row(Row) ->
+    case length(row_to_unique_note_ids(Row)) of
+        0 -> % wtf?
+            Row;
+        1 ->
+            Row;
+        2 ->
+            Row;
+        _ ->
+            split_middle_row_1(Row)
+    end.
+
+split_middle_row_1(Row) ->
+    NoteIds = skip_zeros(Row),
+    LeftNoteId = hd(NoteIds),
+    RightNoteId = lists:last(NoteIds),
+    LeftNote = min_pos(LeftNoteId, Row),
+    RightNote = max_pos(RightNoteId, Row),
+    assert_positive(LeftNoteId),
+    assert_positive(RightNoteId),
+    io:format("NoteIds ~p~n", [NoteIds]),
+    Zipped = zip_row_with_note(Row),
+    [rewrite_middle_note_id(Note, NoteId, LeftNote, LeftNoteId, RightNote, RightNoteId )
+     || {Note, NoteId} <- Zipped].
+
+%% Choose between left and right hand based on distance
+rewrite_middle_note_id(_Note, NoteId, _LeftNote, LeftNoteId, _RightNote, RightNoteId)
+    when NoteId =:= 0;
+         NoteId =:= LeftNoteId;
+         NoteId =:= RightNoteId ->
+    NoteId;
+rewrite_middle_note_id(Note, _NoteId, LeftNote, LeftNoteId, RightNote, RightNoteId) ->
+    DistanceToLeft = Note - LeftNote,
+    DistanceToRight = RightNote - Note,
+    case DistanceToLeft < DistanceToRight of
+        true ->
+            LeftNoteId;
+        false ->
+            RightNoteId
+    end.
+
+link_matrix(M, 0) ->
+    M;
+link_matrix(M, Times) ->
+    M2 = link_matrix(M),
+    link_matrix(M2, Times-1).
+
+link_matrix(M1) ->
+    Rules = link_rules(M1),
+    io:format("LinkingRules ~p~n", [Rules]),
+    M2 = apply_rewrite_rules(Rules, M1),
+    io:format("Linked Matrix~n~160p~n", [M2]),
+    M2.
+
+connect_matrix(M1) ->
+    Rules = connect_rules(M1),
+    io:format("ConnectRules ~p~n", [Rules]),
+    M2 = apply_rewrite_rules(Rules, M1),
+    io:format("Connected Matrix~n~160p~n", [M2]),
+    M2.
+
+link_rules(M) ->
+    %% Find rows with more than 2 noteids
+    Rows1 = [Row || Row <- M, length(row_to_unique_note_ids(Row)) > 2],
+    %% One of middle note can be play only by one hand
+    RulesPerRow = [middle_can_be_play_by_one_hand_rules(Row)
+                   || Row <- Rows1],
+    UsortedRules = lists:usort(lists:merge(RulesPerRow)),
+    DedupRules = rewrite_duplicates(UsortedRules),
+    io:format("DedupRules ~p~n", [DedupRules]),
+    lists:usort(rewrite_rules(DedupRules)).
+
+%% Connect notes for each hands
+%% This function connects all distinct left notes together
+%% This function connects all distinct right notes together
+connect_rules(M) ->
+    %% Find rows with at least 2 noteids
+    Rows1 = [Row || Row <- M, length(row_to_unique_note_ids(Row)) > 1],
+    %% Can be played by two hands only
+    LeftRight = lists:merge([can_be_play_by_two_hand_note_ids(Row)
+                             || Row <- Rows1]),
+    Rules = make_connect_rules(LeftRight),
+    UsortedRules = lists:usort(Rules),
+    DedupRules = rewrite_duplicates(UsortedRules),
+    io:format("DedupRules ~p~n", [DedupRules]),
+    lists:usort(rewrite_rules(DedupRules)).
+
+make_connect_rules(LeftRight) ->
+    {LeftNoteIds, RightNoteIds} = lists:unzip(LeftRight),
+    LeftRules = same_note_rules(LeftNoteIds),
+    RightRules = same_note_rules(RightNoteIds),
+    LeftRules ++ RightRules.
+
+%% Replace all other notes with a highest one
+%% Return usorted rules
+same_note_rules([]) ->
+    [];
+same_note_rules(NoteIds) ->
+    [MaxNoteId|OtherNotesIds] = lists:reverse(lists:usort(NoteIds)),
+    Rules = [{OtherNoteId, MaxNoteId} || OtherNoteId <- OtherNotesIds],
+    lists:reverse(Rules).
+
+%% Return a list of {LeftNoteId, RightNoteId}, if it is not possible to play
+%% them together with one hand only
+can_be_play_by_two_hand_note_ids(Row) ->
+    NoteIds = skip_zeros(Row),
+    LeftNoteId = hd(NoteIds),
+    RightNoteId = lists:last(NoteIds),
+    LeftNote = min_pos(LeftNoteId, Row),
+    RightNote = max_pos(RightNoteId, Row),
+    assert_positive(LeftNoteId),
+    assert_positive(RightNoteId),
+    CanPlay = can_play_together(LeftNote, RightNote),
+    [{LeftNoteId, RightNoteId} || not CanPlay].
+
+middle_can_be_play_by_one_hand_rules(Row) ->
+    NoteIds = skip_zeros(Row),
+    LeftNoteId = hd(NoteIds),
+    RightNoteId = lists:last(NoteIds),
+    assert_positive(LeftNoteId),
+    assert_positive(RightNoteId),
+    io:format("NoteIds ~p~n", [NoteIds]),
+    MiddleNoteIds = [NoteId || NoteId <- NoteIds,
+                               NoteId =/= LeftNoteId,
+                               NoteId =/= RightNoteId],
+    LeftMidNoteId = hd(MiddleNoteIds),
+    RightMidNoteId = lists:last(MiddleNoteIds),
+    assert_positive(LeftMidNoteId),
+    assert_positive(RightMidNoteId),
+    LeftNote = min_pos(LeftNoteId, Row),
+    LeftMidNote = max_pos(LeftMidNoteId, Row),
+    RightNote = max_pos(RightNoteId, Row),
+    RightMidNote = min_pos(RightMidNoteId, Row),
+    assert_positive(LeftNote),
+    assert_positive(LeftMidNote),
+    assert_positive(RightNote),
+    assert_positive(RightMidNote),
+    CanPlayLeftMidWithLeftHand = can_play_together(LeftMidNote, LeftNote),
+    CanPlayLeftMidWithRightHand = can_play_together(LeftMidNote, RightNote),
+    CanPlayRightMidWithLeftHand = can_play_together(RightMidNote, LeftNote),
+    CanPlayRightMidWithRightHand = can_play_together(RightMidNote, RightNote),
+    CanPlayByLeftOnly = CanPlayLeftMidWithLeftHand
+                and not CanPlayLeftMidWithRightHand,
+    CanPlayByRightOnly = CanPlayRightMidWithRightHand
+                 and not CanPlayRightMidWithLeftHand,
+    [rewrite_rule(LeftNoteId, LeftMidNoteId) || CanPlayByLeftOnly]
+    ++
+    [rewrite_rule(RightNoteId, RightMidNoteId) || CanPlayByRightOnly].
+
+assert_positive(X) when X > 0 ->
+    ok.
+
+can_play_together(Note1, Note2) ->
+    abs(Note1 - Note2) < 15.
+
+rewrite_rule(NoteId1, NoteId2) ->
+    {min(NoteId1, NoteId2), max(NoteId1, NoteId2)}.
+
+    
+matrix_to_splits(M1) ->
+    BasicSplits = split_matrix(0, M1),
+    add_missing_splits(BasicSplits, M1).
+
+%% Returns two metrices
+split_matrix_by_splits(AllSplits, Rows) ->
+    Centers = elements(2, AllSplits),
+    CenterRow = lists:zip(Centers, Rows),
+    LeftRight = [split_row(Center, Row) || {Center, Row} <- CenterRow],
+    lists:unzip(LeftRight).
+
+split_row(Center, Row) ->
+    Left = lists:sublist(Row,Center),
+    Right = lists:nthtail(Center,Row),
+    io:format("~160p~n", [Left ++ ['|'] ++ Right]),
+    RightRow = row_set_all_zero(Left) ++ Right,
+    LeftRow = Left ++ row_set_all_zero(Right),
+    {LeftRow, RightRow}.
+
+%% Add split for each row
+add_missing_splits(Splits, M1) ->
+    Size = length(M1),
+    Splits2 = add_start_splits(Splits),
+    Splits3 = add_end_splits(Splits2, Size),
+    add_middle_splits(Splits3).
+
+add_middle_splits([S={StartRowN,_},E={EndRowN,_}|Splits])
+  when (StartRowN + 1) =:= EndRowN ->
+    [S|add_middle_splits([E|Splits])];
+add_middle_splits([S={StartRowN,StartCenter},E={EndRowN,_EndCenter}|Splits]) ->
+    [S]
+    %% It is not important, which center to use, StartCenter or EndCenter
+    ++ [{RowN,StartCenter} || RowN <- lists:seq(StartRowN+1, EndRowN-1)]
+    ++ add_middle_splits([E|Splits]);
+add_middle_splits([Split]) ->
+    [Split].
+    
+
+add_start_splits([{StartRowN,Center}|Splits]) ->
+    [{RowN,Center} || RowN <- lists:seq(1, StartRowN)] ++ Splits.
+
+add_end_splits(Splits, Size) ->
+    {EndRowN,Center} = lists:last(Splits),
+    Splits ++ [{RowN,Center} || RowN <- lists:seq(EndRowN+1, Size)].
+
+
+split_matrix(StartRowN, M1) ->
+    case first_two_different_notes(StartRowN, M1) of
+        false ->
+            [];
+        {RowN, M2, NoteId1, NoteId2, Note1, Note2} ->
+            Center = Note1 + ((Note2 - Note1) div 2),
+            io:format("RowN=~p Center=~p Note1=~p Note2=~p NoteId1=~p NoteId2=~p~n",
+                      [RowN, Center, Note1, Note2, NoteId1, NoteId2]),
+            [{RowN, Center}|split_matrix(RowN, M2)]
+    end.
+
+first_two_different_notes(StartRowN, M1) ->
+    case first_two_different_note_ids(StartRowN, M1) of
+        false ->
+            false;
+        {RowN, M2, NoteId1, NoteId2} ->
+            TraversedRows = lists:sublist(M1, RowN-StartRowN),
+            MaxNotes = [max_pos(NoteId1, Row) || Row <- TraversedRows],
+            MinNotes = [min_pos(NoteId2, Row) || Row <- TraversedRows],
+            %% Get Max of left
+            MaxNote = lists:max(MaxNotes),
+            MinNote = lists:min(skip_zeros(MinNotes)),
+            {RowN, M2, NoteId1, NoteId2, MaxNote, MinNote}
+    end.
+
+skip_zeros(List) ->
+    [X || X <- List, X =/= 0].
+
+replace_with_zero(X, [X|T]) ->
+    [0|replace_with_zero(X, T)];
+replace_with_zero(X, [H|T]) ->
+    [H|replace_with_zero(X, T)];
+replace_with_zero(_, []) ->
+    [].
+
+first_two_different_note_ids(_RowN, []) ->
+    false;
+first_two_different_note_ids(RowN, [Row|Rows]) ->
+    NoteIds = row_to_unique_note_ids(Row),
+    case NoteIds of
+        [NoteId] ->
+            MiddleNote = find_middle_note1(NoteId, Row),
+            first_two_different_note_ids_1(RowN+1, Rows, MiddleNote, NoteId);
+        [_,_|_] ->
+            NoteIds2 = sort_by_note_1(NoteIds, Row),
+            {RowN+1, Rows, hd(NoteIds2), lists:last(NoteIds2)}
+    end.
+
+first_two_different_note_ids_1(_RowN, [], _MiddleNote, _NoteId) ->
+    false;
+first_two_different_note_ids_1(RowN, [Row|Rows], MiddleNote, NoteId) ->
+    NoteIds = row_to_unique_note_ids(Row) -- [NoteId],
+    case NoteIds of
+        [] ->
+            %% Same note
+            first_two_different_note_ids_1(RowN+1, Rows, MiddleNote, NoteId);
+        _ ->
+            NoteIds2 = sort_by_note_2(NoteIds, Row, NoteId, MiddleNote),
+            {RowN+1, Rows, hd(NoteIds2), lists:last(NoteIds2)}
+    end.
+
+row_to_unique_note_ids(Row) ->
+    lists:usort(Row) -- [0].
+
+row_to_unique_notes(Row) ->
+    Notes = lists:seq(1, length(Row)),
+    Zipped = lists:zip(Row, Notes),
+    NotNull = [{NoteId, Note} || {NoteId, Note} <- Zipped, Note =/= 0],
+    Sorted = lists:keysort(1, NotNull),
+    NoteIds = elements(1, Sorted),
+    UniqueNoteIds = lists:usort(NoteIds),
+    [find_middle_note(NoteId, Sorted) || NoteId <- UniqueNoteIds].
+
+sort_by_note_1(NoteIds, Row) ->
+    NoteId2MiddleNote = find_middle_notes(NoteIds, Row),
+    sort_by_note(NoteId2MiddleNote).
+
+sort_by_note_2(NoteIds, Row, NoteId, MiddleNote) ->
+    NoteId2MiddleNote = find_middle_notes(NoteIds, Row),
+    sort_by_note([{NoteId, MiddleNote}|NoteId2MiddleNote]).
+
+sort_by_note(NoteId2MiddleNote) ->
+    elements(1, lists:keysort(2, NoteId2MiddleNote)).
+
+find_middle_note1(NoteId, Row) ->
+    [{NoteId, MiddleNote}] = find_middle_notes([NoteId], Row),
+    MiddleNote.
+
+find_middle_notes(NoteIds, Row) ->
+    Notes = lists:seq(1, length(Row)),
+    Zipped = lists:zip(Row, Notes),
+    NotNull = [{NoteId, Note} || {NoteId, Note} <- Zipped, Note =/= 0],
+    Sorted = lists:keysort(1, NotNull),
+    [{NoteId, find_middle_note(NoteId, Sorted)} || NoteId <- NoteIds].
+
+find_middle_note(NoteId, Sorted) ->
+    Notes = [Note || {NoteId1, Note} <- Sorted, NoteId1 =:= NoteId],
+    SortedNotes = lists:usort(Notes),
+    middle_note(SortedNotes).
+
+middle_note(Notes) ->
+    Size = length(Notes),
+    lists:nth((Size div 2) + 1, Notes).
+
+rewrite_matrix(M1, _LimitRange, Times, MaxTimes) when Times =:= (MaxTimes + 1) ->
+    M1; % MaxTimes reached
+rewrite_matrix(M1, LimitRange, Times, MaxTimes) ->
+    M2 = rewrite_matrix_up(M1, LimitRange, Times),
+    M3 = rewrite_matrix_left(M2, LimitRange, Times),
+    M4 = rewrite_matrix_left_up(M3, LimitRange, Times),
+    case count_unique_matrix_notes(M4) of
+        1 -> % One hand?!
+            M4;
+        2 -> % Two hands! :)
+            M4;
+        N ->
+            io:format("N=~p~n", [N]),
+            % Continue again
+            rewrite_matrix(M4, LimitRange, Times+1, MaxTimes)
+    end.
+
+rewrite_matrix_left(M, LimitRange, Times) ->
+    Rules = note_ids_to_merge_left(M, Times),
+    M2 = apply_rewrite_rules(Rules, M),
+    revert_overdo_rewrites(Rules, M, M2, LimitRange, 3).
+
+rewrite_matrix_up(M, LimitRange, Times) ->
+    Rules = note_ids_to_merge_up(M, Times),
+    M2 = apply_rewrite_rules(Rules, M),
+    revert_overdo_rewrites(Rules, M, M2, LimitRange, 3).
+
+rewrite_matrix_left_up(M, LimitRange, Times) ->
+    Rules = note_ids_to_merge_left_up(M, Times),
+    M2 = apply_rewrite_rules(Rules, M),
+    revert_overdo_rewrites(Rules, M, M2, LimitRange, 3).
+
+%% Cancel rewrites, that are impossible to play
+revert_overdo_rewrites(_Rules, _M, M2, _LimitRange, 0) ->
+    M2;
+revert_overdo_rewrites(Rules, M, M2, LimitRange, Times) ->
+    BadRules = overdo_rules(Rules, M, M2, LimitRange),
+    RedoRules = Rules -- BadRules,
+    M3 = apply_rewrite_rules(RedoRules, M),
+    revert_overdo_rewrites(RedoRules, M, M3, LimitRange, Times-1).
+
+overdo_rules(Rules, M, M2, LimitRange) ->
+    Zipped = merge_matrices_with_zip(M, M2),
+    BadRulesPerRow = [revert_overdo_rewrites_row(Rules, Row, LimitRange) || Row <- Zipped],
+    lists:merge(BadRulesPerRow).
+
+revert_overdo_rewrites_row(Rules, ZippedRow, LimitRange) ->
+    NewRow = elements(2, ZippedRow),
+    NewNoteIds = unique_new_rewritten_note_ids(ZippedRow),
+    BadNewNoteIds = [NewNoteId || NewNoteId <- NewNoteIds,
+                                  is_range_too_big(NewNoteId, NewRow, LimitRange)
+                                  orelse
+                                  has_splits(NewNoteId, NewRow)],
+    case BadNewNoteIds of
+        [] ->
+            [];
+        _ ->
+            BadRules = [Rule||Rule={_,NewNoteId} <- Rules, lists:member(NewNoteId, BadNewNoteIds)],
+            io:format("BadNewNoteIds ~p~n", [BadNewNoteIds]),
+            io:format("BadRules ~p~n", [BadRules]),
+            BadRules
+    end.
+
+has_splits(NewNoteId, NewRow) ->
+    MinNote = min_pos(NewNoteId, NewRow),
+    MaxNote = max_pos(NewNoteId, NewRow),
+    Between = lists:sublist(NewRow, MinNote, MaxNote-MinNote),
+    lists:any(fun(NoteId) -> NoteId =/= 0 andalso NoteId =/= NewNoteId end,
+              Between).
+
+is_range_too_big(NewNoteId, NewRow, LimitRange) ->
+    MinNote = min_pos(NewNoteId, NewRow),
+    MaxNote = max_pos(NewNoteId, NewRow),
+    (MaxNote - MinNote) > LimitRange.
+
+elements(N, Xs) ->
+    [element(N, X) || X <- Xs].
+
+min_pos(X, List) ->
+    min_pos(X, List, 1).
+
+min_pos(X, [X|_], N) ->
+    N;
+min_pos(X, [_|T], N) ->
+    min_pos(X, T, N+1);
+min_pos(_, [], _) ->
+    0.
+
+max_pos(X, List) ->
+    max_pos(X, List, 1, 0).
+
+max_pos(X, [X|T], N, _M) ->
+    max_pos(X, T, N+1, N); % new max
+max_pos(X, [_|T], N, M) ->
+    max_pos(X, T, N+1, M); % old max
+max_pos(_, [], _, M) ->
+    M.
+
+unique_new_rewritten_note_ids(Row) ->
+    lists:usort([NewNoteId || {OldNoteId, NewNoteId} <- Row, OldNoteId =/= NewNoteId, NewNoteId =/= 0]).
+
+
+count_unique_matrix_notes(M) ->
+    length(unique_matrix_notes(M)).
+
+unique_matrix_notes(M) ->
+    lists:usort(lists:flatten(M)) -- [0].
+
+apply_rewrite_rules(Rules, M) ->
+    RulesDict = dict:from_list(Rules),
+    F = fun(NoteId) -> get_dict_value(NoteId, RulesDict, NoteId) end,
+    map_matrix(F, M).
+
+note_ids_to_merge_left(M1, Times) ->
+    M2 = shift_matrix_left(M1, Times),
+    generate_rewrite_rules(M1, M2).
+
+note_ids_to_merge_up(M1, Times) ->
+    M2 = shift_matrix_up(M1, Times),
+    generate_rewrite_rules(M1, M2).
+
+note_ids_to_merge_left_up(M1, Times) ->
+    M2 = shift_matrix_left(M1, Times),
+    M3 = shift_matrix_up(M2, Times),
+    generate_rewrite_rules(M1, M3).
+
+generate_rewrite_rules(M1, M2) ->
+    M3 = merge_matrices_with_zip(M1, M2),
+    UsortedRules = note_ids_to_merge_usorted(M3),
+    DedupRules = rewrite_duplicates(UsortedRules),
+    lists:usort(rewrite_rules(DedupRules)).
+
+%% Handle duplicates: [{1,2},{1,4},{2,3}] => [{1,4},{2,4},{3,4}]
+%% New rule {2,4} is direct, {3,4} is inderect
+rewrite_duplicates([{NoteId,NewNoteId1},{NoteId,NewNoteId2}|Rules]) ->
+    %% Direct rule
+    NewRule1 = {NoteId,NewNoteId2},
+    %% Indirect rule
+    NewRule2 = {NewNoteId1,NewNoteId2},
+    %% Handle indirect rule later
+    Rules2 = ordsets:add_element(NewRule1, Rules),
+    Rules3 = ordsets:add_element(NewRule2, Rules2),
+    %% Recurse
+    rewrite_duplicates(Rules3);
+rewrite_duplicates([Rule|Rules]) ->
+    %% Ignore the rule
+    [Rule|rewrite_duplicates(Rules)];
+rewrite_duplicates([]) ->
+    [].
+
+%% Apply rules to themself: [{1,2},{2,3}] => [{1,3},{2,3}]
+rewrite_rules([{NoteId1,NoteId2}|UsortedRules]) ->
+    NoteId3 = find_final_replacenment(NoteId2, UsortedRules),
+    Rule = {NoteId1,NoteId3},
+    [Rule|rewrite_rules(UsortedRules)];
+rewrite_rules([]) ->
+    [].
+
+%% find_final_replacenment(1, [{1,3},{2,1}]) => 3
+find_final_replacenment(NoteId, [{NoteId,NewNoteId}|RevUsortedRules]) ->
+    find_final_replacenment(NewNoteId, RevUsortedRules);
+find_final_replacenment(NoteId, [{HeadNoteId,_}|RevUsortedRules])
+    when NoteId < HeadNoteId -> %% not found yet
+    find_final_replacenment(NoteId, RevUsortedRules);
+find_final_replacenment(NoteId, _) ->
+    NoteId.
+
+
+note_ids_to_merge_usorted(M3) ->
+    lists:usort(note_ids_to_merge(M3)).
+
+note_ids_to_merge(M3) ->
+    [{min(V1, V2), max(V1, V2)}
+     || Row <- M3,
+        {V1, V2} <- Row,
+        V1 =/= 0,
+        V2 =/= 0,
+        V1 =/= V2].
+
+merge_matrices_with_zip(M1, M2) ->
+    merge_matrices_with(fun(V1,V2) -> {V1, V2} end, M1, M2).
+
+%% Two dimention zip
+merge_matrices_with(F, M1, M2) ->
+    F2 = fun(Row1, Row2) ->
+            lists:zipwith(F, Row1, Row2)
+         end,
+    lists:zipwith(F2, M1, M2).
+
+
+map_matrix(F, M) ->
+    F2 = fun(Row) ->
+            lists:map(F, Row)
+         end,
+    lists:map(F2, M).
+
+shift_matrix_left(M, 0) ->
+    M;
+shift_matrix_left(M, Times) when Times > 0 ->
+    M1 = shift_matrix_left(M),
+    shift_matrix_left(M1, Times-1).
+
+shift_matrix_up(M, 0) ->
+    M;
+shift_matrix_up(M, Times) when Times > 0 ->
+    M1 = shift_matrix_up(M),
+    shift_matrix_up(M1, Times-1).
+
+shift_matrix_left(M) ->
+    [shift_list_left(Row) || Row <- M].
+
+shift_matrix_up(M2) ->
+    tl(M2) ++ [row_set_all_zero(hd(M2))].
+
+shift_list_left(Row) ->
+    tl(Row) ++ [0].
+
+row_set_all_zero(Row) ->
+    [0 || _ <- Row].
+
+%% Get numeric id of pressed note (group) or 0.
+time_and_note_to_note_id(Time, Note, TimeNote2NoteIdDict) ->
+    get_dict_value({Time, Note}, TimeNote2NoteIdDict, 0).
+
+get_dict_value(Key, Dict, Default) ->
+    case dict:find(Key, Dict) of
+        {ok, Value} ->
+            Value;
+        error ->
+            Default
+    end.
+
+groups_to_all_times(Groups) ->
+    [group_to_time(Group) || Group <- Groups].
+
+groups_to_all_notes(Groups) ->
+    Notes = groups_to_notes(Groups),
+    MinNote = lists:min(Notes),
+    MaxNote = lists:max(Notes),
+    lists:seq(MinNote, MaxNote).
+
+zip_row_with_note(Row) ->
+    Notes = lists:seq(1, length(Row)),
+    lists:zip(Notes, Row).
