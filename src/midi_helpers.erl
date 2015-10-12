@@ -606,12 +606,24 @@ rewrite_matrix(M1) ->
     %% We should split them into:
     %%          LL          LR             RR
     M8 = split_middle_matrix(M7),
-    %% Use merged matrix for splits
-    AllSplits = matrix_to_splits(M8),
-    %% Split rewritten matrix for debugging
-    split_matrix_by_splits(AllSplits, M8),
-    %% Split original matrix
-    split_matrix_by_splits(AllSplits, M1).
+    {LeftNoteId, RightNoteId} = find_left_and_right_note_id(M8),
+    LeftMatrixMask = filter_matrix(LeftNoteId, M8),
+    RightMatrixMask = filter_matrix(RightNoteId, M8),
+    LeftMatrix = apply_mask(LeftMatrixMask, M1),
+    RightMatrix = apply_mask(RightMatrixMask, M1),
+    {LeftMatrix, RightMatrix}.
+
+find_left_and_right_note_id([Row|Rows]) ->
+    NoteIds = skip_zeros(Row),
+    LeftNoteId = hd(NoteIds),
+    RightNoteId = lists:last(NoteIds),
+    case LeftNoteId =/= RightNoteId of
+        true ->
+            {LeftNoteId, RightNoteId};
+        false ->
+            find_left_and_right_note_id(Rows)
+    end.
+
 
 split_middle_matrix(Rows) ->
     [split_middle_row(Row) || Row <- Rows].
@@ -774,78 +786,6 @@ can_play_together(Note1, Note2) ->
 rewrite_rule(NoteId1, NoteId2) ->
     {min(NoteId1, NoteId2), max(NoteId1, NoteId2)}.
 
-    
-matrix_to_splits(M1) ->
-    BasicSplits = split_matrix(0, M1),
-    add_missing_splits(BasicSplits, M1).
-
-%% Returns two metrices
-split_matrix_by_splits(AllSplits, Rows) ->
-    Centers = elements(2, AllSplits),
-    CenterRow = lists:zip(Centers, Rows),
-    LeftRight = [split_row(Center, Row) || {Center, Row} <- CenterRow],
-    lists:unzip(LeftRight).
-
-split_row(Center, Row) ->
-    Left = lists:sublist(Row,Center),
-    Right = lists:nthtail(Center,Row),
-    io:format("~160p~n", [Left ++ ['|'] ++ Right]),
-    RightRow = row_set_all_zero(Left) ++ Right,
-    LeftRow = Left ++ row_set_all_zero(Right),
-    {LeftRow, RightRow}.
-
-%% Add split for each row
-add_missing_splits(Splits, M1) ->
-    Size = length(M1),
-    Splits2 = add_start_splits(Splits),
-    Splits3 = add_end_splits(Splits2, Size),
-    add_middle_splits(Splits3).
-
-add_middle_splits([S={StartRowN,_},E={EndRowN,_}|Splits])
-  when (StartRowN + 1) =:= EndRowN ->
-    [S|add_middle_splits([E|Splits])];
-add_middle_splits([S={StartRowN,StartCenter},E={EndRowN,_EndCenter}|Splits]) ->
-    [S]
-    %% It is not important, which center to use, StartCenter or EndCenter
-    ++ [{RowN,StartCenter} || RowN <- lists:seq(StartRowN+1, EndRowN-1)]
-    ++ add_middle_splits([E|Splits]);
-add_middle_splits([Split]) ->
-    [Split].
-    
-
-add_start_splits([{StartRowN,Center}|Splits]) ->
-    [{RowN,Center} || RowN <- lists:seq(1, StartRowN)] ++ Splits.
-
-add_end_splits(Splits, Size) ->
-    {EndRowN,Center} = lists:last(Splits),
-    Splits ++ [{RowN,Center} || RowN <- lists:seq(EndRowN+1, Size)].
-
-
-split_matrix(StartRowN, M1) ->
-    case first_two_different_notes(StartRowN, M1) of
-        false ->
-            [];
-        {RowN, M2, NoteId1, NoteId2, Note1, Note2} ->
-            Center = Note1 + ((Note2 - Note1) div 2),
-            io:format("RowN=~p Center=~p Note1=~p Note2=~p NoteId1=~p NoteId2=~p~n",
-                      [RowN, Center, Note1, Note2, NoteId1, NoteId2]),
-            [{RowN, Center}|split_matrix(RowN, M2)]
-    end.
-
-first_two_different_notes(StartRowN, M1) ->
-    case first_two_different_note_ids(StartRowN, M1) of
-        false ->
-            false;
-        {RowN, M2, NoteId1, NoteId2} ->
-            TraversedRows = lists:sublist(M1, RowN-StartRowN),
-            MaxNotes = [max_pos(NoteId1, Row) || Row <- TraversedRows],
-            MinNotes = [min_pos(NoteId2, Row) || Row <- TraversedRows],
-            %% Get Max of left
-            MaxNote = lists:max(MaxNotes),
-            MinNote = lists:min(skip_zeros(MinNotes)),
-            {RowN, M2, NoteId1, NoteId2, MaxNote, MinNote}
-    end.
-
 skip_zeros(List) ->
     [X || X <- List, X =/= 0].
 
@@ -856,74 +796,8 @@ replace_with_zero(X, [H|T]) ->
 replace_with_zero(_, []) ->
     [].
 
-first_two_different_note_ids(_RowN, []) ->
-    false;
-first_two_different_note_ids(RowN, [Row|Rows]) ->
-    NoteIds = row_to_unique_note_ids(Row),
-    case NoteIds of
-        [NoteId] ->
-            MiddleNote = find_middle_note1(NoteId, Row),
-            first_two_different_note_ids_1(RowN+1, Rows, MiddleNote, NoteId);
-        [_,_|_] ->
-            NoteIds2 = sort_by_note_1(NoteIds, Row),
-            {RowN+1, Rows, hd(NoteIds2), lists:last(NoteIds2)}
-    end.
-
-first_two_different_note_ids_1(_RowN, [], _MiddleNote, _NoteId) ->
-    false;
-first_two_different_note_ids_1(RowN, [Row|Rows], MiddleNote, NoteId) ->
-    NoteIds = row_to_unique_note_ids(Row) -- [NoteId],
-    case NoteIds of
-        [] ->
-            %% Same note
-            first_two_different_note_ids_1(RowN+1, Rows, MiddleNote, NoteId);
-        _ ->
-            NoteIds2 = sort_by_note_2(NoteIds, Row, NoteId, MiddleNote),
-            {RowN+1, Rows, hd(NoteIds2), lists:last(NoteIds2)}
-    end.
-
 row_to_unique_note_ids(Row) ->
     lists:usort(Row) -- [0].
-
-row_to_unique_notes(Row) ->
-    Notes = lists:seq(1, length(Row)),
-    Zipped = lists:zip(Row, Notes),
-    NotNull = [{NoteId, Note} || {NoteId, Note} <- Zipped, Note =/= 0],
-    Sorted = lists:keysort(1, NotNull),
-    NoteIds = elements(1, Sorted),
-    UniqueNoteIds = lists:usort(NoteIds),
-    [find_middle_note(NoteId, Sorted) || NoteId <- UniqueNoteIds].
-
-sort_by_note_1(NoteIds, Row) ->
-    NoteId2MiddleNote = find_middle_notes(NoteIds, Row),
-    sort_by_note(NoteId2MiddleNote).
-
-sort_by_note_2(NoteIds, Row, NoteId, MiddleNote) ->
-    NoteId2MiddleNote = find_middle_notes(NoteIds, Row),
-    sort_by_note([{NoteId, MiddleNote}|NoteId2MiddleNote]).
-
-sort_by_note(NoteId2MiddleNote) ->
-    elements(1, lists:keysort(2, NoteId2MiddleNote)).
-
-find_middle_note1(NoteId, Row) ->
-    [{NoteId, MiddleNote}] = find_middle_notes([NoteId], Row),
-    MiddleNote.
-
-find_middle_notes(NoteIds, Row) ->
-    Notes = lists:seq(1, length(Row)),
-    Zipped = lists:zip(Row, Notes),
-    NotNull = [{NoteId, Note} || {NoteId, Note} <- Zipped, Note =/= 0],
-    Sorted = lists:keysort(1, NotNull),
-    [{NoteId, find_middle_note(NoteId, Sorted)} || NoteId <- NoteIds].
-
-find_middle_note(NoteId, Sorted) ->
-    Notes = [Note || {NoteId1, Note} <- Sorted, NoteId1 =:= NoteId],
-    SortedNotes = lists:usort(Notes),
-    middle_note(SortedNotes).
-
-middle_note(Notes) ->
-    Size = length(Notes),
-    lists:nth((Size div 2) + 1, Notes).
 
 rewrite_matrix(M1, _LimitRange, Times, MaxTimes) when Times =:= (MaxTimes + 1) ->
     M1; % MaxTimes reached
@@ -1169,3 +1043,13 @@ groups_to_all_notes(Groups) ->
 zip_row_with_note(Row) ->
     Notes = lists:seq(1, length(Row)),
     lists:zip(Notes, Row).
+
+%% Keep only KeepNoteId, set others to zero
+filter_matrix(KeepNoteId, M) ->
+    map_matrix(fun(NoteId) ->
+                   case NoteId of KeepNoteId -> NoteId; _ -> 0 end
+               end, M).
+
+%% Use value from M, if corresponding value from LeftMatrixMask is not zero
+apply_mask(LeftMatrixMask, M) ->
+    merge_matrices_with(fun(0,_) -> 0; (_, NoteId) -> NoteId end, LeftMatrixMask, M).
